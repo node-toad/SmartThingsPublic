@@ -14,28 +14,26 @@ echo  !CYAN!  AnythingLLM Setup ^& Prerequisites Check!RESET!
 echo  !CYAN!======================================================!RESET!
 echo.
 
-set "PASS=0"
 set "FAIL=0"
 
-:: ---- Node.js ----
+:: ---- Required tools ----
 call :check_tool "node" "--version" "Node.js"
 call :check_tool "npm"  "--version" "npm"
+call :check_tool "git"  "--version" "Git"
 
 :: ---- Yarn (optional) ----
-where yarn >nul 2>&1 && (
-    echo  !GREEN![+] yarn     found!RESET!
-) || (
-    echo  !YELLOW![-] yarn     not found (optional, npm will be used instead)!RESET!
+where yarn >nul 2>&1
+if !errorlevel! equ 0 (
+    echo  !GREEN![+] yarn     found (optional)!RESET!
+) else (
+    echo  !YELLOW![-] yarn     not found (optional - npm will be used instead)!RESET!
 )
 
-:: ---- Git ----
-call :check_tool "git" "--version" "Git"
-
 echo.
-if !FAIL! gtr 0 (
-    echo  !RED![!] Some prerequisites are missing.!RESET!
-    echo  !YELLOW!  Install Node.js: https://nodejs.org/!RESET!
-    echo  !YELLOW!  Install Git:     https://git-scm.com/!RESET!
+if !FAIL! GTR 0 (
+    echo  !RED![!] Some required tools are missing.!RESET!
+    echo  !YELLOW!  Install Node.js ^& npm : https://nodejs.org/!RESET!
+    echo  !YELLOW!  Install Git            : https://git-scm.com/!RESET!
     pause
     exit /b 1
 )
@@ -72,14 +70,15 @@ echo.
 echo  !CYAN![>] Installing server dependencies ...!RESET!
 pushd "%~dp0anythingllm\server"
 
-where yarn >nul 2>&1 && (
+where yarn >nul 2>&1
+if !errorlevel! equ 0 (
     yarn install
-) || (
+) else (
     npm install
 )
 
 if !errorlevel! neq 0 (
-    echo  !RED![!] Dependency installation failed.!RESET!
+    echo  !RED![!] Server dependency installation failed.!RESET!
     popd
     pause
     exit /b 1
@@ -90,7 +89,12 @@ echo.
 echo  !CYAN![>] Installing frontend dependencies ...!RESET!
 if exist "%~dp0anythingllm\frontend" (
     pushd "%~dp0anythingllm\frontend"
-    where yarn >nul 2>&1 && (yarn install) || (npm install)
+    where yarn >nul 2>&1
+    if !errorlevel! equ 0 (
+        yarn install
+    ) else (
+        npm install
+    )
     popd
 )
 
@@ -104,17 +108,19 @@ pause
 exit /b 0
 
 :: -------------------------------------------------------
+:: :check_tool <exe> <version-flag> <display-name>
+:: Sets FAIL+=1 if the tool is not found.
 :check_tool
     where %~1 >nul 2>&1
-    if !errorlevel! equ 0 (
-        for /f "delims=" %%V in ('%~1 %~2 2^>^&1') do (
-            echo  !GREEN![+] %~3    %%V!RESET!
-            goto :check_done_%~1
-        )
+    if !errorlevel! neq 0 (
+        echo  !RED![x] %~3    NOT FOUND!RESET!
+        set /a FAIL+=1
+        goto :eof
     )
-    echo  !RED![x] %~3    NOT FOUND!RESET!
-    set /a FAIL+=1
-    :check_done_%~1
+    for /f "delims=" %%V in ('%~1 %~2 2^>^&1') do (
+        echo  !GREEN![+] %~3    %%V!RESET!
+        goto :eof
+    )
     goto :eof
 
 :: -------------------------------------------------------

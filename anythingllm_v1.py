@@ -1,5 +1,5 @@
 """
-AnythingLLM Launcher  —  Version 1.0
+AnythingLLM Launcher  —  Version 1.1
 GUI desktop app (tkinter, stdlib only) that collects API key + model ID,
 applies environment variables, and starts/stops the AnythingLLM server.
 """
@@ -8,17 +8,21 @@ import json
 import os
 import platform
 import queue
+import shutil
+import signal
+import socket
 import subprocess
-import sys
 import threading
 import tkinter as tk
+import webbrowser
+from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE   = "AnythingLLM Launcher"
-APP_VERSION = "v1.0"
+APP_VERSION = "v1.1"
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "anythingllm_v1.json")
 WIN = platform.system() == "Windows"
 
@@ -90,6 +94,7 @@ COLORS = {
     "subtext":  "#6272a4",
     "log_bg":   "#12121e",
     "log_text": "#a9b7d0",
+    "ts":       "#44475a",
 }
 
 # ---------------------------------------------------------------------------
@@ -135,6 +140,19 @@ def find_anythingllm(hint=""):
             return p
     return ""
 
+def pick_runtime():
+    """Return the first available [exe, *args] tuple for running AnythingLLM."""
+    for exe, args in [("yarn", ["start"]), ("node", ["index.js"]), ("npm", ["start"])]:
+        if shutil.which(exe):
+            return [exe] + args
+    return None
+
+def port_in_use(port: int) -> bool:
+    """Return True if something is already bound to *port* on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -143,17 +161,20 @@ class App(tk.Tk):
         super().__init__()
         self.title(f"{APP_TITLE}  {APP_VERSION}")
         self.resizable(True, True)
-        self.minsize(700, 600)
+        self.minsize(720, 640)
         self.configure(bg=COLORS["bg"])
 
-        self._cfg   = load_config()
-        self._proc  = None        # server subprocess
-        self._queue = queue.Queue()
+        self._cfg        = load_config()
+        self._proc       = None
+        self._queue      = queue.Queue()
+        self._server_url = ""
 
         self._build_ui()
         self._load_saved_state()
         self._poll_log()
 
+        self.bind("<Return>", lambda _: self._launch() if str(self.launch_btn["state"]) == tk.NORMAL else None)
+        self.bind("<Escape>", lambda _: self._stop()   if str(self.stop_btn["state"])   == tk.NORMAL else None)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------
@@ -162,21 +183,21 @@ class App(tk.Tk):
     def _build_ui(self):
         self._style()
 
-        # Header
-        hdr = tk.Frame(self, bg=COLORS["accent"], height=4)
-        hdr.pack(fill=tk.X)
+        # Accent bar
+        tk.Frame(self, bg=COLORS["accent"], height=4).pack(fill=tk.X)
 
-        title_frame = tk.Frame(self, bg=COLORS["bg"], pady=16)
+        # Title row
+        title_frame = tk.Frame(self, bg=COLORS["bg"], pady=14)
         title_frame.pack(fill=tk.X, padx=24)
         tk.Label(title_frame, text=APP_TITLE, font=("Segoe UI", 20, "bold"),
                  fg=COLORS["text"], bg=COLORS["bg"]).pack(side=tk.LEFT)
         tk.Label(title_frame, text=APP_VERSION, font=("Segoe UI", 11),
-                 fg=COLORS["subtext"], bg=COLORS["bg"]).pack(side=tk.LEFT, padx=8, pady=6)
+                 fg=COLORS["subtext"], bg=COLORS["bg"]).pack(side=tk.LEFT, padx=8, pady=5)
 
         # Settings panel
         panel = tk.Frame(self, bg=COLORS["panel"], bd=0,
                          highlightthickness=1, highlightbackground=COLORS["border"])
-        panel.pack(fill=tk.X, padx=24, pady=(0, 12))
+        panel.pack(fill=tk.X, padx=24, pady=(0, 10))
 
         self._build_provider_row(panel)
         self._build_api_key_row(panel)
@@ -197,7 +218,7 @@ class App(tk.Tk):
             activeforeground="white", relief=tk.FLAT, cursor="hand2",
             padx=20, pady=10, command=self._launch,
         )
-        self.launch_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.launch_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.stop_btn = tk.Button(
             btn_frame, text="■  Stop",
@@ -206,22 +227,38 @@ class App(tk.Tk):
             activeforeground="white", relief=tk.FLAT, cursor="hand2",
             padx=20, pady=10, command=self._stop, state=tk.DISABLED,
         )
-        self.stop_btn.pack(side=tk.LEFT)
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.browser_btn = tk.Button(
+            btn_frame, text="⎋  Open Browser",
+            font=("Segoe UI", 12),
+            bg=COLORS["panel"], fg=COLORS["text"],
+            activebackground=COLORS["border"], activeforeground=COLORS["text"],
+            relief=tk.FLAT, cursor="hand2",
+            padx=16, pady=10, command=self._open_browser, state=tk.DISABLED,
+        )
+        self.browser_btn.pack(side=tk.LEFT)
 
         self.status_lbl = tk.Label(btn_frame, text="●  Stopped",
                                    font=("Segoe UI", 10),
                                    fg=COLORS["subtext"], bg=COLORS["bg"])
         self.status_lbl.pack(side=tk.RIGHT, padx=8)
 
-        # Log
+        # Log header
         log_hdr = tk.Frame(self, bg=COLORS["bg"])
-        log_hdr.pack(fill=tk.X, padx=24, pady=(4, 0))
+        log_hdr.pack(fill=tk.X, padx=24, pady=(6, 0))
         tk.Label(log_hdr, text="Server Log", font=("Segoe UI", 10, "bold"),
                  fg=COLORS["subtext"], bg=COLORS["bg"]).pack(side=tk.LEFT)
+
+        self._autoscroll_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(log_hdr, text="Auto-scroll", variable=self._autoscroll_var,
+                       font=("Segoe UI", 9), fg=COLORS["subtext"], bg=COLORS["bg"],
+                       activebackground=COLORS["bg"], selectcolor=COLORS["bg"]).pack(side=tk.RIGHT)
         tk.Button(log_hdr, text="Clear", font=("Segoe UI", 9),
                   fg=COLORS["subtext"], bg=COLORS["bg"], bd=0, cursor="hand2",
-                  command=self._clear_log).pack(side=tk.RIGHT)
+                  command=self._clear_log).pack(side=tk.RIGHT, padx=8)
 
+        # Log text area
         log_frame = tk.Frame(self, bg=COLORS["log_bg"],
                              highlightthickness=1, highlightbackground=COLORS["border"])
         log_frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 16))
@@ -234,6 +271,7 @@ class App(tk.Tk):
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.log.pack(fill=tk.BOTH, expand=True)
 
+        self.log.tag_config("ts",      foreground=COLORS["ts"])
         self.log.tag_config("info",    foreground=COLORS["log_text"])
         self.log.tag_config("ok",      foreground=COLORS["accent2"])
         self.log.tag_config("warn",    foreground=COLORS["warning"])
@@ -391,18 +429,15 @@ class App(tk.Tk):
         if not p:
             return
 
-        # model list
         self._model_cb["values"] = p["models"]
         if self._model_var.get() not in p["models"]:
             self._model_var.set(p["default_model"])
 
-        # API key row visibility
         if p["needs_key"]:
-            self._api_key_row.pack(fill=tk.X)
+            self._api_key_row.pack(fill=tk.X, after=self._api_key_row.master.winfo_children()[0])
         else:
             self._api_key_row.pack_forget()
 
-        # extras
         self._azure_frame.pack_forget()
         self._generic_frame.pack_forget()
         if p["id"] == "azure":
@@ -418,6 +453,10 @@ class App(tk.Tk):
         if path:
             self._path_var.set(path)
 
+    def _open_browser(self):
+        if self._server_url:
+            webbrowser.open(self._server_url)
+
     # ------------------------------------------------------------------
     # Launch / Stop
     # ------------------------------------------------------------------
@@ -431,9 +470,9 @@ class App(tk.Tk):
             messagebox.showerror("Error", "Please select a provider.")
             return
 
-        api_key  = self._api_key_var.get().strip()
-        model_id = self._model_var.get().strip()
-        port     = self._port_var.get().strip() or "3001"
+        api_key   = self._api_key_var.get().strip()
+        model_id  = self._model_var.get().strip()
+        port_str  = self._port_var.get().strip() or "3001"
         base_path = self._path_var.get().strip()
 
         if p["needs_key"] and not api_key:
@@ -441,6 +480,25 @@ class App(tk.Tk):
             return
         if not model_id:
             messagebox.showerror("Error", "Model ID cannot be empty.")
+            return
+
+        try:
+            port = int(port_str)
+        except ValueError:
+            messagebox.showerror("Error", f"'{port_str}' is not a valid port number.")
+            return
+
+        # Check port availability
+        if port_in_use(port):
+            if not messagebox.askyesno(
+                "Port In Use",
+                f"Port {port} is already in use.\n\n"
+                "This may mean AnythingLLM is already running.\n"
+                "Open the browser anyway?"
+            ):
+                return
+            self._server_url = f"http://localhost:{port}"
+            webbrowser.open(self._server_url)
             return
 
         # Locate AnythingLLM
@@ -454,11 +512,18 @@ class App(tk.Tk):
             )
             return
 
-        # Build env
+        # Pick runtime
+        cmd = pick_runtime()
+        if not cmd:
+            messagebox.showerror("Error",
+                                 "Cannot find yarn, node, or npm.\nPlease install Node.js.")
+            return
+
+        # Build environment
         env = os.environ.copy()
         env["LLM_PROVIDER"]         = p["id"]
         env["LLM_MODEL_PREFERENCE"] = model_id
-        env["SERVER_PORT"]          = port
+        env["SERVER_PORT"]          = str(port)
         if p["env_key"] and api_key:
             env[p["env_key"]] = api_key
         if p["id"] == "azure":
@@ -470,25 +535,22 @@ class App(tk.Tk):
         if p["id"] == "ollama" and "OLLAMA_BASE_PATH" not in env:
             env["OLLAMA_BASE_PATH"] = "http://127.0.0.1:11434"
 
-        # Pick runtime
-        server_dir = os.path.join(install_dir, "server")
-        cmd = self._pick_runtime(server_dir)
-        if not cmd:
-            messagebox.showerror("Error",
-                                 "Cannot find yarn, node, or npm.\nPlease install Node.js.")
-            return
-
-        # Save config
+        # Persist settings
         if self._save_var.get():
             self._save_state(api_key)
 
-        # Launch
+        self._server_url = f"http://localhost:{port}"
+
         self._log(f"=== Launching AnythingLLM ({p['label']}) — model: {model_id} ===", "heading")
         self._log(f"    Install dir : {install_dir}", "info")
         self._log(f"    Runtime     : {' '.join(cmd)}", "info")
-        self._log(f"    URL         : http://localhost:{port}", "ok")
+        self._log(f"    URL         : {self._server_url}  (Enter to open once ready)", "ok")
 
+        server_dir = os.path.join(install_dir, "server")
         try:
+            kwargs = {}
+            if WIN:
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             self._proc = subprocess.Popen(
                 cmd,
                 cwd=server_dir,
@@ -497,6 +559,7 @@ class App(tk.Tk):
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                **kwargs,
             )
         except FileNotFoundError as exc:
             self._log(f"Launch failed: {exc}", "error")
@@ -508,21 +571,14 @@ class App(tk.Tk):
     def _stop(self):
         if self._proc and self._proc.poll() is None:
             self._log("--- Stopping server ---", "warn")
-            if WIN:
-                self._proc.send_signal(__import__("signal").CTRL_BREAK_EVENT)
-            else:
-                self._proc.terminate()
-        self._set_running(False)
-
-    def _pick_runtime(self, server_dir):
-        for exe, args in [("yarn", ["start"]), ("node", ["index.js"]), ("npm", ["start"])]:
             try:
-                full = __import__("shutil").which(exe)
-                if full:
-                    return [full] + args
-            except Exception:
-                pass
-        return None
+                if WIN:
+                    self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    self._proc.terminate()
+            except OSError:
+                self._proc.kill()
+        self._set_running(False)
 
     # ------------------------------------------------------------------
     # Output streaming
@@ -552,8 +608,11 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
     def _log(self, msg, kind="info"):
         self.log.configure(state=tk.NORMAL)
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log.insert(tk.END, f"[{ts}] ", "ts")
         self.log.insert(tk.END, msg + "\n", kind)
-        self.log.see(tk.END)
+        if self._autoscroll_var.get():
+            self.log.see(tk.END)
         self.log.configure(state=tk.DISABLED)
 
     def _clear_log(self):
@@ -568,10 +627,12 @@ class App(tk.Tk):
         if running:
             self.launch_btn.configure(state=tk.DISABLED)
             self.stop_btn.configure(state=tk.NORMAL)
+            self.browser_btn.configure(state=tk.NORMAL)
             self.status_lbl.configure(text="●  Running", fg=COLORS["accent2"])
         else:
             self.launch_btn.configure(state=tk.NORMAL)
             self.stop_btn.configure(state=tk.DISABLED)
+            self.browser_btn.configure(state=tk.DISABLED)
             self.status_lbl.configure(text="●  Stopped", fg=COLORS["subtext"])
 
     def _current_provider(self):
@@ -583,11 +644,9 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
     def _load_saved_state(self):
         c = self._cfg
-        # provider
-        labels = [p["label"] for p in PROVIDERS]
         saved_label = next(
             (p["label"] for p in PROVIDERS if p["id"] == c.get("provider_id")),
-            labels[0]
+            PROVIDERS[0]["label"],
         )
         self._provider_var.set(saved_label)
         self._on_provider_change()

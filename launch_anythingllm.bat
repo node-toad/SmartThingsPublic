@@ -249,23 +249,37 @@ exit /b 0
 
     :: Try yarn first, then node, then npm
     pushd "!ANYTHINGLLM_DIR!\server"
-    where yarn >nul 2>&1 && (
+    set "RUNTIME_FOUND=0"
+
+    where yarn >nul 2>&1
+    if !errorlevel! equ 0 (
         echo  !GREEN![+] Launching with yarn ...!RESET!
+        set "RUNTIME_FOUND=1"
         yarn start
-        goto :after_launch
     )
-    where node >nul 2>&1 && (
-        echo  !GREEN![+] Launching with node ...!RESET!
-        node index.js
-        goto :after_launch
+
+    if !RUNTIME_FOUND! equ 0 (
+        where node >nul 2>&1
+        if !errorlevel! equ 0 (
+            echo  !GREEN![+] Launching with node ...!RESET!
+            set "RUNTIME_FOUND=1"
+            node index.js
+        )
     )
-    where npm >nul 2>&1 && (
-        echo  !GREEN![+] Launching with npm ...!RESET!
-        npm start
-        goto :after_launch
+
+    if !RUNTIME_FOUND! equ 0 (
+        where npm >nul 2>&1
+        if !errorlevel! equ 0 (
+            echo  !GREEN![+] Launching with npm ...!RESET!
+            set "RUNTIME_FOUND=1"
+            npm start
+        )
     )
-    echo  !RED![!] Could not find yarn, node, or npm.  Please install Node.js.!RESET!
-    :after_launch
+
+    if !RUNTIME_FOUND! equ 0 (
+        echo  !RED![!] Could not find yarn, node, or npm.  Please install Node.js.!RESET!
+    )
+
     popd
     goto :eof
 
