@@ -2,20 +2,25 @@
 <#
 .SYNOPSIS
     Packages the AnythingLLM Launcher into a distributable ZIP and a
-    single-file self-extracting installer (PowerShell).
+    single-file self-extracting installer.
 .DESCRIPTION
-    Reads every launcher file, base64-encodes it, then writes two outputs:
+    Produces two outputs in -OutputDir:
 
-      AnythingLLM_Launcher_v1.1.zip         <- traditional ZIP archive
-      AnythingLLM_Launcher_Setup_v1.1.ps1   <- self-extracting installer
-                                               (single file, no other deps)
+      AnythingLLM_Launcher_v<Version>.zip
+          Traditional ZIP — extract anywhere and run run.bat.
 
-    Run this script once to produce the distributables, then share either
-    output file with users.
+      AnythingLLM_Launcher_v<Version>_Setup.ps1
+          Self-extracting single-file installer. All launcher files are
+          embedded as base64. SHA-256 hashes are embedded for integrity
+          verification on extraction. No internet required.
+
+    Run once to build, then share either output with end users.
 .EXAMPLE
     .\pack.ps1
-    .\pack.ps1 -OutputDir C:\builds
+    .\pack.ps1 -OutputDir C:\releases
+    .\pack.ps1 -OutputDir C:\releases -Version 2.0
 #>
+[CmdletBinding()]
 param(
     [string]$OutputDir = $PSScriptRoot,
     [string]$Version   = "1.1"
@@ -28,7 +33,7 @@ $PackageName = "AnythingLLM_Launcher_v$Version"
 $Root        = $PSScriptRoot
 
 # ---------------------------------------------------------------------------
-# Files to bundle (relative to the repo root)
+# Files to bundle
 # ---------------------------------------------------------------------------
 $BUNDLE = @(
     "run.bat",
@@ -40,98 +45,134 @@ $BUNDLE = @(
 )
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Console helpers
 # ---------------------------------------------------------------------------
-function Write-Step([string]$msg) {
-    Write-Host "  [>] $msg" -ForegroundColor Cyan
+function Write-Header {
+    Write-Host ""
+    Write-Host "  #############################################################" -ForegroundColor Cyan
+    Write-Host "  #   AnythingLLM Launcher  v$Version  --  Pack Tool           " -ForegroundColor Cyan
+    Write-Host "  #############################################################" -ForegroundColor Cyan
+    Write-Host ""
 }
-function Write-Ok([string]$msg) {
-    Write-Host "  [+] $msg" -ForegroundColor Green
-}
-function Write-Fail([string]$msg) {
-    Write-Host "  [!] $msg" -ForegroundColor Red
-}
+function Write-Section([string]$t) { Write-Host "  --- $t " -ForegroundColor Yellow }
+function Write-Step([string]$t)    { Write-Host "  [>] $t"  -ForegroundColor Cyan   }
+function Write-Ok([string]$t)      { Write-Host "  [+] $t"  -ForegroundColor Green  }
+function Write-Fail([string]$t)    { Write-Host "  [!] $t"  -ForegroundColor Red    }
+
+Write-Header
 
 # ---------------------------------------------------------------------------
-# Verify all source files exist
+# 1 — Verify source files
 # ---------------------------------------------------------------------------
+Write-Section "Verifying source files"
 Write-Host ""
-Write-Host "  AnythingLLM Launcher — Pack Tool  v$Version" -ForegroundColor Yellow
-Write-Host "  =============================================" -ForegroundColor Yellow
-Write-Host ""
-Write-Step "Verifying source files ..."
 
 $missing = $false
 foreach ($f in $BUNDLE) {
-    $full = Join-Path $Root $f
-    if (Test-Path $full) {
-        Write-Host "    OK  $f" -ForegroundColor DarkGray
+    if (Test-Path (Join-Path $Root $f)) {
+        $size = (Get-Item (Join-Path $Root $f)).Length
+        Write-Host ("    {0,-32} {1,8} bytes" -f $f, $size) -ForegroundColor DarkGray
     } else {
         Write-Fail "MISSING  $f"
         $missing = $true
     }
 }
 if ($missing) {
+    Write-Host ""
     Write-Fail "One or more source files are missing. Aborting."
     exit 1
 }
 
 # ---------------------------------------------------------------------------
-# 1. Build ZIP archive
+# 2 — Read, hash, and encode every file
 # ---------------------------------------------------------------------------
 Write-Host ""
-Write-Step "Creating ZIP archive ..."
+Write-Section "Reading and encoding files"
+Write-Host ""
+
+$sha256   = [System.Security.Cryptography.SHA256]::Create()
+$encoded  = [ordered]@{}   # filename -> base64
+$hashes   = [ordered]@{}   # filename -> hex sha256
+
+foreach ($f in $BUNDLE) {
+    $bytes        = [System.IO.File]::ReadAllBytes((Join-Path $Root $f))
+    $encoded[$f]  = [Convert]::ToBase64String($bytes)
+    $hashBytes    = $sha256.ComputeHash($bytes)
+    $hashes[$f]   = ($hashBytes | ForEach-Object { $_.ToString("x2") }) -join ""
+    Write-Host ("    {0,-32} SHA256: {1}" -f $f, $hashes[$f].Substring(0,16) + "...") -ForegroundColor DarkGray
+}
+$sha256.Dispose()
+
+# ---------------------------------------------------------------------------
+# 3 — Build ZIP archive
+# ---------------------------------------------------------------------------
+Write-Host ""
+Write-Section "Creating ZIP archive"
+Write-Host ""
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $ZipPath = Join-Path $OutputDir "$PackageName.zip"
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
 
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-
 $zip = [System.IO.Compression.ZipFile]::Open($ZipPath, 'Create')
 foreach ($f in $BUNDLE) {
-    $full = Join-Path $Root $f
     [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-        $zip, $full, $f, [System.IO.Compression.CompressionLevel]::Optimal
+        $zip,
+        (Join-Path $Root $f),
+        $f,
+        [System.IO.Compression.CompressionLevel]::Optimal
     ) | Out-Null
 }
 $zip.Dispose()
 
-Write-Ok "ZIP  →  $ZipPath"
+$zipSize = [math]::Round((Get-Item $ZipPath).Length / 1KB, 1)
+Write-Ok "ZIP created  ($zipSize KB)  →  $ZipPath"
 
 # ---------------------------------------------------------------------------
-# 2. Build self-extracting installer
+# 4 — Build self-extracting installer
 # ---------------------------------------------------------------------------
 Write-Host ""
-Write-Step "Encoding files for self-extracting installer ..."
+Write-Section "Generating self-extracting installer"
+Write-Host ""
 
-# Build a hashtable: filename -> base64 string
-$encoded = [ordered]@{}
-foreach ($f in $BUNDLE) {
-    $bytes         = [System.IO.File]::ReadAllBytes((Join-Path $Root $f))
-    $encoded[$f]   = [Convert]::ToBase64String($bytes)
-    Write-Host "    encoded  $f  ($($bytes.Length) bytes)" -ForegroundColor DarkGray
+# Serialize embedded data as PowerShell ordered-hashtable literals
+function ConvertTo-PSLiteral([System.Collections.Specialized.OrderedDictionary]$ht) {
+    $sb = [System.Text.StringBuilder]::new()
+    $null = $sb.AppendLine("[ordered]@{")
+    foreach ($kv in $ht.GetEnumerator()) {
+        $null = $sb.AppendLine("    '$($kv.Key)' = '$($kv.Value)'")
+    }
+    $null = $sb.Append("}")
+    return $sb.ToString()
 }
 
-# Serialize to a PowerShell literal that the installer can eval
-$filesLiteral = "@{`n"
-foreach ($kv in $encoded.GetEnumerator()) {
-    $filesLiteral += "    '$($kv.Key)' = '$($kv.Value)'`n"
-}
-$filesLiteral += "}"
+$filesLiteral  = ConvertTo-PSLiteral $encoded
+$hashesLiteral = ConvertTo-PSLiteral $hashes
 
-# ---------------------------------------------------------------------------
-# Installer script template
-# ---------------------------------------------------------------------------
-$installerScript = @"
+# Timestamp for the generated file header
+$buildStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+# ---- Installer template (backtick-escaped $ for runtime vars) ----
+$installer = @"
 #Requires -Version 5.1
 <#
-.SYNOPSIS
-    AnythingLLM Launcher  v$Version  — Self-Extracting Installer
-    Single-file installer generated by pack.ps1.
-    All launcher files are embedded; no internet connection required.
-.EXAMPLE
-    .\AnythingLLM_Launcher_Setup_v$Version.ps1
-    .\AnythingLLM_Launcher_Setup_v$Version.ps1 -InstallDir C:\Tools\AnythingLLM
+    AnythingLLM Launcher  v$Version  --  Self-Extracting Installer
+    Generated by pack.ps1 on $buildStamp
+
+    All launcher files are embedded as base64 with SHA-256 integrity
+    checks. No internet connection required.
+
+    USAGE
+        Double-click, or from PowerShell:
+            .\${PackageName}_Setup.ps1
+            .\${PackageName}_Setup.ps1 -InstallDir "C:\Tools\AnythingLLM"
+            .\${PackageName}_Setup.ps1 -InstallDir "C:\Tools\AnythingLLM" -Silent
+
+    PARAMETERS
+        -InstallDir   Target folder (prompted interactively if omitted)
+        -NoShortcut   Skip desktop and Start-Menu shortcut creation
+        -Silent       Non-interactive; uses defaults, skips all prompts
 #>
 param(
     [string]`$InstallDir = "",
@@ -142,154 +183,255 @@ param(
 Set-StrictMode -Version Latest
 `$ErrorActionPreference = "Stop"
 
-# ------------------------------------------------------------------
-# Embedded files  (base64-encoded, generated by pack.ps1)
-# ------------------------------------------------------------------
-`$FILES = $filesLiteral
+# ==========================================================================
+# EMBEDDED DATA  (generated by pack.ps1 -- do not edit manually)
+# ==========================================================================
+`$_FILES = $filesLiteral
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-function Write-Banner {
+`$_HASHES = $hashesLiteral
+
+# ==========================================================================
+# INTERNALS
+# ==========================================================================
+`$_VERSION  = "$Version"
+`$_APPNAME  = "AnythingLLM Launcher"
+`$_PKGNAME  = "$PackageName"
+
+function _Write-Banner {
     Write-Host ""
-    Write-Host "  ============================================================" -ForegroundColor Cyan
-    Write-Host "    AnythingLLM Launcher  v$Version  —  Installer" -ForegroundColor Cyan
-    Write-Host "  ============================================================" -ForegroundColor Cyan
+    Write-Host "  ##############################################################" -ForegroundColor Cyan
+    Write-Host "  ##  `$_APPNAME  v`$_VERSION  --  Installer               " -ForegroundColor Cyan
+    Write-Host "  ##############################################################" -ForegroundColor Cyan
     Write-Host ""
 }
 
-function Check-Prereq([string]`$Name, [string]`$Cmd, [string]`$Url) {
-    if (-not (Get-Command `$Cmd -ErrorAction SilentlyContinue)) {
-        Write-Host "  [!] `$Name is not installed." -ForegroundColor Red
-        Write-Host "      Download: `$Url" -ForegroundColor Yellow
+function _Write-Section([string]`$t) { Write-Host "" ; Write-Host "  --- `$t " -ForegroundColor Yellow ; Write-Host "" }
+function _Write-Ok([string]`$t)      { Write-Host "  [+] `$t" -ForegroundColor Green  }
+function _Write-Warn([string]`$t)    { Write-Host "  [~] `$t" -ForegroundColor Yellow }
+function _Write-Fail([string]`$t)    { Write-Host "  [!] `$t" -ForegroundColor Red    }
+
+function _Check-Tool([string]`$Name, [string]`$Cmd, [string]`$Url, [bool]`$Required = `$false) {
+    `$found = Get-Command `$Cmd -ErrorAction SilentlyContinue
+    if (-not `$found) {
+        if (`$Required) {
+            _Write-Fail "`$Name  NOT FOUND  (required)  --  `$Url"
+        } else {
+            _Write-Warn "`$Name  not found  (optional) --  `$Url"
+        }
         return `$false
     }
-    `$ver = & `$Cmd --version 2>&1 | Select-Object -First 1
-    Write-Host "  [+] `$Name  `$ver" -ForegroundColor Green
+    `$ver = (& `$Cmd --version 2>&1) | Select-Object -First 1
+    _Write-Ok "`$Name  `$ver"
     return `$true
 }
 
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
-Write-Banner
-
-# --- Prerequisite checks ---
-Write-Host "  --- Prerequisites ------------------------------------------------" -ForegroundColor Yellow
-Write-Host ""
-`$ok = `$true
-`$ok = (Check-Prereq "Node.js" "node" "https://nodejs.org/")   -and `$ok
-`$ok = (Check-Prereq "npm"     "npm"  "https://nodejs.org/")   -and `$ok
-Check-Prereq "Python 3" "python" "https://python.org/" | Out-Null
-Check-Prereq "yarn"     "yarn"   "https://yarnpkg.com/" | Out-Null   # optional
-if (-not `$ok) {
-    Write-Host ""
-    Write-Host "  [!] Required prerequisites are missing." -ForegroundColor Red
-    if (-not `$Silent) {
-        Write-Host "      Install Node.js first, then re-run this installer." -ForegroundColor Yellow
-        Read-Host "  Press Enter to exit"
+function _Verify-Hash([string]`$File, [byte[]]`$Bytes) {
+    `$sha  = [System.Security.Cryptography.SHA256]::Create()
+    `$got  = (`$sha.ComputeHash(`$Bytes) | ForEach-Object { `$_.ToString("x2") }) -join ""
+    `$sha.Dispose()
+    `$want = `$_HASHES[`$File]
+    if (`$got -ne `$want) {
+        throw "Integrity check failed for '`$File'.`nExpected: `$want`nGot:      `$got"
     }
-    exit 1
 }
 
-# --- Choose install directory ---
+function _Find-Python {
+    foreach (`$candidate in @("pythonw", "python3", "python")) {
+        `$cmd = Get-Command `$candidate -ErrorAction SilentlyContinue
+        if (`$cmd) { return `$cmd.Source }
+    }
+    return "python"
+}
+
+function _Create-Shortcut([string]`$LnkPath, [string]`$Target, [string]`$Args, [string]`$WorkDir, [string]`$Desc) {
+    `$wsh        = New-Object -ComObject WScript.Shell
+    `$lnk        = `$wsh.CreateShortcut(`$LnkPath)
+    `$lnk.TargetPath       = `$Target
+    `$lnk.Arguments        = `$Args
+    `$lnk.WorkingDirectory = `$WorkDir
+    `$lnk.Description      = `$Desc
+    `$lnk.Save()
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject(`$wsh) | Out-Null
+}
+
+# ==========================================================================
+# MAIN
+# ==========================================================================
+_Write-Banner
+
+# --------------------------------------------------------------------------
+# Prerequisites
+# --------------------------------------------------------------------------
+_Write-Section "Prerequisites"
+
+`$hasPython = _Check-Tool "Python 3" "python"  "https://python.org/"      `$false
+`$hasNode   = _Check-Tool "Node.js"  "node"    "https://nodejs.org/"      `$false
+`$hasNpm    = _Check-Tool "npm"      "npm"     "https://nodejs.org/"      `$false
+               _Check-Tool "yarn"    "yarn"    "https://yarnpkg.com/"     `$false | Out-Null
+
 Write-Host ""
-Write-Host "  --- Install Location --------------------------------------------" -ForegroundColor Yellow
-Write-Host ""
+if (-not `$hasPython) {
+    _Write-Warn "Python 3 not found. The GUI (run.bat / anythingllm_v1.py) needs it."
+    _Write-Warn "Install from https://python.org/ then re-launch run.bat."
+}
+if (-not `$hasNode -or -not `$hasNpm) {
+    _Write-Warn "Node.js / npm not found. AnythingLLM itself needs them."
+    _Write-Warn "Install from https://nodejs.org/ then run setup_anythingllm.bat."
+}
+
+if ((-not `$hasPython -or -not `$hasNode) -and -not `$Silent) {
+    `$cont = Read-Host "  [?] Continue installation anyway? (Y/n)"
+    if (`$cont -imatch '^n') { exit 0 }
+}
+
+# --------------------------------------------------------------------------
+# Choose install directory
+# --------------------------------------------------------------------------
+_Write-Section "Install Location"
 
 if (`$InstallDir -eq "") {
-    `$default = Join-Path `$env:USERPROFILE "AnythingLLM-Launcher"
-    if (-not `$Silent) {
-        `$input = Read-Host "  [?] Install directory (blank = `$default)"
-        `$InstallDir = if (`$input.Trim() -eq "") { `$default } else { `$input.Trim() }
+    `$defaultDir = Join-Path `$env:USERPROFILE "`$_APPNAME"
+    if (`$Silent) {
+        `$InstallDir = `$defaultDir
     } else {
-        `$InstallDir = `$default
+        `$choice = Read-Host "  [?] Install directory  (blank = `$defaultDir)"
+        `$InstallDir = if (`$choice.Trim() -eq "") { `$defaultDir } else { `$choice.Trim() }
     }
 }
 
-if (-not (Test-Path `$InstallDir)) {
-    New-Item -ItemType Directory -Path `$InstallDir -Force | Out-Null
-    Write-Host "  [+] Created  `$InstallDir" -ForegroundColor Green
-} else {
-    Write-Host "  [+] Target   `$InstallDir  (already exists)" -ForegroundColor Green
-}
-
-# --- Extract files ---
-Write-Host ""
-Write-Host "  --- Extracting Files -------------------------------------------" -ForegroundColor Yellow
-Write-Host ""
-foreach (`$kv in `$FILES.GetEnumerator()) {
-    `$dest  = Join-Path `$InstallDir `$kv.Key
-    `$bytes = [Convert]::FromBase64String(`$kv.Value)
-    [System.IO.File]::WriteAllBytes(`$dest, `$bytes)
-    Write-Host "  [+] `$(`$kv.Key)" -ForegroundColor Green
-}
-
-# --- Desktop shortcut ---
-if (-not `$NoShortcut) {
-    `$createShortcut = `$true
+if (Test-Path `$InstallDir) {
     if (-not `$Silent) {
-        `$ans = Read-Host "  [?] Create desktop shortcut? (Y/n)"
-        `$createShortcut = (`$ans -imatch '^y$|^$')
+        `$ow = Read-Host "  [?] '`$InstallDir' already exists. Overwrite? (Y/n)"
+        if (`$ow -imatch '^n') { Write-Host "  Cancelled." ; exit 0 }
+    }
+    _Write-Warn "Overwriting existing files in `$InstallDir"
+} else {
+    New-Item -ItemType Directory -Path `$InstallDir -Force | Out-Null
+    _Write-Ok "Created  `$InstallDir"
+}
+
+# --------------------------------------------------------------------------
+# Extract and verify files
+# --------------------------------------------------------------------------
+_Write-Section "Extracting Files"
+
+foreach (`$entry in `$_FILES.GetEnumerator()) {
+    `$name  = `$entry.Key
+    `$bytes = [Convert]::FromBase64String(`$entry.Value)
+    _Verify-Hash `$name `$bytes
+    `$dest = Join-Path `$InstallDir `$name
+    [System.IO.File]::WriteAllBytes(`$dest, `$bytes)
+    _Write-Ok `$name
+}
+
+# --------------------------------------------------------------------------
+# Write uninstaller
+# --------------------------------------------------------------------------
+`$uninstPath = Join-Path `$InstallDir "uninstall.ps1"
+`$uninstContent = @'
+#Requires -Version 5.1
+param([switch]`$Silent)
+`$dir = Split-Path -Parent `$MyInvocation.MyCommand.Path
+Write-Host ""
+Write-Host "  AnythingLLM Launcher -- Uninstaller" -ForegroundColor Yellow
+Write-Host ""
+if (-not `$Silent) {
+    `$c = Read-Host "  Remove '`$dir' and all shortcuts? (y/N)"
+    if (`$c -notmatch '^y') { Write-Host "  Cancelled."; exit 0 }
+}
+`$wsh     = New-Object -ComObject WScript.Shell
+`$desktop = `$wsh.SpecialFolders("Desktop")
+`$startM  = `$wsh.SpecialFolders("Programs")
+`$lnk1 = Join-Path `$desktop  "AnythingLLM Launcher.lnk"
+`$lnk2 = Join-Path `$startM   "AnythingLLM Launcher\AnythingLLM Launcher.lnk"
+if (Test-Path `$lnk1) { Remove-Item `$lnk1 -Force; Write-Host "  [+] Removed desktop shortcut" -ForegroundColor Green }
+if (Test-Path `$lnk2) { Remove-Item (Split-Path `$lnk2) -Recurse -Force; Write-Host "  [+] Removed Start Menu entry" -ForegroundColor Green }
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject(`$wsh) | Out-Null
+Remove-Item `$dir -Recurse -Force
+Write-Host "  [+] Removed `$dir" -ForegroundColor Green
+Write-Host ""
+Write-Host "  Uninstall complete." -ForegroundColor Green
+'@
+[System.IO.File]::WriteAllText(`$uninstPath, `$uninstContent, [System.Text.Encoding]::UTF8)
+_Write-Ok "uninstall.ps1  (run to remove all files and shortcuts)"
+
+# --------------------------------------------------------------------------
+# Shortcuts
+# --------------------------------------------------------------------------
+if (-not `$NoShortcut) {
+    `$createSC = `$true
+    if (-not `$Silent) {
+        `$sc = Read-Host "  [?] Create shortcuts (Desktop + Start Menu)? (Y/n)"
+        `$createSC = `$sc -notmatch '^n'
     }
 
-    if (`$createShortcut) {
-        `$wsh      = New-Object -ComObject WScript.Shell
-        `$desktop  = `$wsh.SpecialFolders("Desktop")
-        `$lnk      = `$wsh.CreateShortcut("`$desktop\AnythingLLM Launcher.lnk")
+    if (`$createSC) {
+        _Write-Section "Creating Shortcuts"
 
-        # Use pythonw.exe (no console window) if available, else python
-        `$pyExe = (Get-Command pythonw -ErrorAction SilentlyContinue)?.Source
-        if (-not `$pyExe) { `$pyExe = (Get-Command python -ErrorAction SilentlyContinue)?.Source }
-        if (-not `$pyExe) { `$pyExe = "python" }
+        `$pyExe   = _Find-Python
+        `$pyArg   = "`"`$(Join-Path `$InstallDir 'anythingllm_v1.py')`""
+        `$desc    = "`$_APPNAME v`$_VERSION"
+        `$wsh     = New-Object -ComObject WScript.Shell
 
-        `$lnk.TargetPath       = `$pyExe
-        `$lnk.Arguments        = "`"`$(Join-Path `$InstallDir 'anythingllm_v1.py')`""
-        `$lnk.WorkingDirectory = `$InstallDir
-        `$lnk.Description      = "AnythingLLM Launcher v$Version"
-        `$lnk.Save()
-        Write-Host "  [+] Desktop shortcut created." -ForegroundColor Green
+        # Desktop shortcut
+        `$desktopLnk = Join-Path (`$wsh.SpecialFolders("Desktop")) "`$_APPNAME.lnk"
+        _Create-Shortcut `$desktopLnk `$pyExe `$pyArg `$InstallDir `$desc
+        _Write-Ok "Desktop  ->  `$desktopLnk"
+
+        # Start Menu shortcut
+        `$startDir = Join-Path (`$wsh.SpecialFolders("Programs")) `$_APPNAME
+        if (-not (Test-Path `$startDir)) { New-Item -ItemType Directory `$startDir -Force | Out-Null }
+        `$startLnk = Join-Path `$startDir "`$_APPNAME.lnk"
+        _Create-Shortcut `$startLnk `$pyExe `$pyArg `$InstallDir `$desc
+        _Write-Ok "Start Menu  ->  `$startLnk"
+
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject(`$wsh) | Out-Null
     }
 }
 
-# --- Done ---
+# --------------------------------------------------------------------------
+# Done
+# --------------------------------------------------------------------------
 Write-Host ""
-Write-Host "  ============================================================" -ForegroundColor Green
+Write-Host "  ##############################################################" -ForegroundColor Green
 Write-Host "    Installation complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "    To launch:  `$InstallDir\run.bat" -ForegroundColor Green
-Write-Host "                (or double-click the desktop shortcut)" -ForegroundColor Green
+Write-Host "    Location : `$InstallDir" -ForegroundColor Green
 Write-Host ""
-Write-Host "    First time? Run setup_anythingllm.bat to install" -ForegroundColor Green
-Write-Host "    AnythingLLM itself and its dependencies." -ForegroundColor Green
-Write-Host "  ============================================================" -ForegroundColor Green
+Write-Host "    NEXT STEPS:" -ForegroundColor Yellow
+Write-Host "      1. Run setup_anythingllm.bat  (first time only)" -ForegroundColor White
+Write-Host "         Installs Node.js deps and clones AnythingLLM." -ForegroundColor DarkGray
+Write-Host "      2. Run run.bat  (or use the desktop shortcut)" -ForegroundColor White
+Write-Host "         Opens the launcher GUI." -ForegroundColor DarkGray
+Write-Host "      3. Enter API key + model, click Launch." -ForegroundColor White
+Write-Host ""
+Write-Host "    To uninstall: run uninstall.ps1 inside the install folder." -ForegroundColor DarkGray
+Write-Host "  ##############################################################" -ForegroundColor Green
 Write-Host ""
 
 if (-not `$Silent) {
-    `$open = Read-Host "  [?] Open install folder now? (Y/n)"
-    if (`$open -imatch '^y$|^$') {
-        Start-Process explorer.exe `$InstallDir
-    }
+    `$openDir = Read-Host "  [?] Open install folder in Explorer? (Y/n)"
+    if (`$openDir -notmatch '^n') { Start-Process explorer.exe `$InstallDir }
 }
 "@
 
-# Write installer
 $SetupPath = Join-Path $OutputDir "${PackageName}_Setup.ps1"
-[System.IO.File]::WriteAllText($SetupPath, $installerScript, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($SetupPath, $installer, [System.Text.Encoding]::UTF8)
 
-Write-Ok "Installer  →  $SetupPath"
+$setupSize = [math]::Round((Get-Item $SetupPath).Length / 1KB, 1)
+Write-Ok "Installer created  ($setupSize KB)  →  $SetupPath"
 
 # ---------------------------------------------------------------------------
-# Summary
+# 5 — Summary
 # ---------------------------------------------------------------------------
 Write-Host ""
-Write-Host "  ============================================================" -ForegroundColor Green
-Write-Host "    Pack complete  —  $PackageName" -ForegroundColor Green
+Write-Host "  ##############################################################" -ForegroundColor Green
+Write-Host "    Pack complete  --  $PackageName" -ForegroundColor Green
 Write-Host ""
-Write-Host "    ZIP        $ZipPath" -ForegroundColor Green
-Write-Host "    Installer  $SetupPath" -ForegroundColor Green
+Write-Host ("    ZIP        {0,-8} KB   {1}" -f $zipSize,   $ZipPath)   -ForegroundColor Green
+Write-Host ("    Installer  {0,-8} KB   {1}" -f $setupSize, $SetupPath) -ForegroundColor Green
 Write-Host ""
-Write-Host "    Share either file.  The installer is self-contained:" -ForegroundColor DarkGray
-Write-Host "    run it on any Windows machine with no other files needed." -ForegroundColor DarkGray
-Write-Host "  ============================================================" -ForegroundColor Green
+Write-Host "    The installer is fully self-contained — one file," -ForegroundColor DarkGray
+Write-Host "    no internet needed, works on any Windows 10/11 PC." -ForegroundColor DarkGray
+Write-Host "  ##############################################################" -ForegroundColor Green
 Write-Host ""
